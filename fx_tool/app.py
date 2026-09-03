@@ -12,17 +12,22 @@ from fastapi.responses import JSONResponse
 
 from fx_tool.config import Settings, load_settings
 from fx_tool.errors import ConversionError
-from fx_tool.service import Conversion, Converter
+from fx_tool.service import Conversion, Converter, ecb_today
 from fx_tool.upstream import UpstreamClient
 
 
-def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    clock=ecb_today,
+) -> FastAPI:
+    """`transport` and `clock` exist so tests can fake the upstream and freeze today."""
     settings = settings or load_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         upstream = UpstreamClient(settings.upstream_base, settings.upstream_timeout_seconds, transport)
-        app.state.converter = Converter(settings, upstream)
+        app.state.converter = Converter(settings, upstream, clock=clock)
         try:
             yield
         finally:
