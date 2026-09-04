@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from decimal import Decimal
 
 import httpx
+import simplejson
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -14,6 +14,13 @@ from fx_tool.config import Settings, load_settings
 from fx_tool.errors import ConversionError
 from fx_tool.service import Conversion, Converter, ecb_today
 from fx_tool.upstream import UpstreamClient
+
+
+class DecimalJSONResponse(JSONResponse):
+    def render(self, content: object) -> bytes:
+        return simplejson.dumps(
+            content, use_decimal=True, allow_nan=False, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
 
 
 def create_app(
@@ -53,22 +60,18 @@ def create_app(
     ) -> JSONResponse:
         converter: Converter = request.app.state.converter
         conversion = await converter.convert(amount, from_, to, date)
-        return JSONResponse(status_code=200, content=_body(conversion))
+        return DecimalJSONResponse(status_code=200, content=_body(conversion))
 
     return app
 
 
-def _number(value: Decimal) -> int | float:
-    return int(value) if value == value.to_integral_value() else float(value)
-
-
 def _body(c: Conversion) -> dict:
     body = {
-        "amount": _number(c.amount),
+        "amount": c.amount,
         "from": c.base,
         "to": c.target,
-        "rate": _number(c.rate),
-        "result": _number(c.result),
+        "rate": c.rate,
+        "result": c.result,
         "rate_date": c.rate_date.isoformat(),
         "asked_date": c.asked_date.isoformat(),
         "source": "ECB via frankfurter.dev",
@@ -76,8 +79,8 @@ def _body(c: Conversion) -> dict:
     }
     if c.is_fallback:
         body["note"] = (
-            f"No ECB rate was published for {c.asked_date.isoformat()}; "
-            f"this is the most recent earlier rate, from {c.rate_date.isoformat()}."
+            f"The provider returned an earlier rate for {c.asked_date.isoformat()}; "
+            f"the rate used is from {c.rate_date.isoformat()}."
         )
     return body
 

@@ -43,7 +43,7 @@ def date_before_series(asked: str, first: str) -> ConversionError:
 
 def unknown_currency(base: str, target: str) -> ConversionError:
     return ConversionError(
-        404, "unknown_currency", f"The ECB publishes no rate for {base}/{target}; one of the codes is not supported."
+        404, "unknown_currency", f"No rate is available for {base}/{target} on the requested date; the pair may be unsupported or lack historical coverage."
     )
 
 
@@ -60,7 +60,7 @@ def upstream_unavailable(detail: str) -> ConversionError:
 
 
 def upstream_timeout(seconds: float) -> ConversionError:
-    return ConversionError(504, "upstream_timeout", f"The rate provider did not answer within {seconds:g} seconds.")
+    return ConversionError(504, "upstream_timeout", f"A rate-provider network operation timed out (limit: {seconds:g} seconds per operation).")
 
 
 def upstream_error(status: int) -> ConversionError:
