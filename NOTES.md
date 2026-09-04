@@ -2,62 +2,49 @@
 
 ## Decisions
 
-**A missing rate is answered with the nearest earlier one, and the response says so.**
-Frankfurter itself answers a Saturday query with Friday's rate *dated Friday*. I
-read that date and pass it on as `rate_date`, set `rate_is_fallback: true` and add
-a one-sentence `note`, so the model can tell the customer "this is Friday's rate".
-The alternative, refusing weekends outright, makes the tool useless two days a
-week for a question ("what did I pay on Saturday?") that has a well-understood
-answer. Two guard rails: a rate older than 7 days is refused (`no_rate_for_date`),
-and a rate dated *after* the asked day is refused as `upstream_invalid`, because
-nothing legitimate produces it.
+**Earlier rates are visible.** Weekend/holiday queries may use an earlier rate,
+with the upstream's actual `rate_date`, the requested `asked_date`, a fallback
+flag and a note. Gaps over seven days are refused. Future and pre-series dates
+are rejected locally; today's date follows Europe/Berlin. An ECB reference
+conversion is an estimate, not proof of the rate a bank charged a customer.
 
-**Future dates are refused before touching the upstream.** Live probe: Frankfurter
-answers tomorrow's date with today's rate, HTTP 200. Trusting that would present a
-rate as belonging to a day that has no rate yet. "Today" is the ECB's day
-(Europe/Berlin), not the server's.
+**One rounding step.** JSON rates are parsed directly into Decimal; a local
+64-digit context keeps multiplication exact within the documented input bounds.
+Only the result is rounded, half up to two decimals (a tool policy, not a
+currency-specific settlement rule). `simplejson` writes Decimal as JSON numbers
+without float conversion. Clients must also use a decimal-aware parser to retain
+that precision. Extreme numbers are rejected, not silently rounded or overflowed.
 
-**Amounts are `Decimal` end to end.** Ten decimal places are accepted and echoed
-back; `result` is quantised to cents, half up; the rate is passed through
-unrounded. Money never goes through a float except at JSON serialisation.
+**Cache only validated rates.** The bounded in-memory cache uses `(from, to,
+requested day)`. Historical responses have no TTL; today's expire after ten
+minutes. This assumes historical publication data is stable. Failures, including
+invalid/stale rate dates, are never cached. Different amounts reuse the same rate.
 
-**Cache keyed by `(from, to, date)`.** Past days are final and cached for good;
-"today" is cached for 10 minutes because the ECB publishes around 16:00 CET and a
-noon answer is superseded the same afternoon. Failures are never cached.
-
-**`unknown_currency` is inferred from an upstream 404** once local checks have
-ruled out future and pre-1999 dates. Calling `/v1/currencies` first would be
-more exact but adds a second endpoint the fake upstream must serve.
+**404 is ambiguous.** After local date checks, upstream 404 maps to
+`unknown_currency`; a supported currency with no historical coverage can receive
+that code too. The message acknowledges this limitation rather than claiming
+the code never exists.
 
 ## With another day
 
-- Deduplicate concurrent identical requests (one in-flight fetch per key); today
-  two simultaneous first questions both hit the upstream.
-- Warm the cache with `/v1/currencies` once at start, with a TTL, for a precise
-  `unknown_currency` versus `no_rate_for_date` distinction.
-- Structured logging with the upstream latency and cache hit/miss per request, and
-  a tiny `/health` that reports upstream reachability.
-- Property tests for the arithmetic (result never exceeds `amount * rate`
-  rounded, inverse pairs agree within a cent).
-- A `tool.py` pull request applying REVIEW.md findings 1 and 2.
+- Coalesce simultaneous cache misses for the same key into one upstream fetch.
+- Use currency metadata to distinguish unsupported codes from historical gaps.
+- Add request latency/cache-hit logging and a refresh policy for historical corrections.
 
 ## AI tools
 
-Claude Code, throughout. I gave it the brief and the two questions I needed to
-decide myself (holiday policy, amount precision); it probed the live API for the
-edge cases, drafted the modules and the test suite, and I read every file before
-it was committed. Part B was done the same way: it listed the suspicions, then
-each one was reproduced against a running `tool.py` before it went into
-REVIEW.md, and the "not a timeout problem" finding came from that check rather
-than from reading.
+Claude Code was used for the initial API exploration, implementation, tests and
+review draft. Codex then reviewed the submission and reproduced defects using
+controlled upstream responses, added regression tests, corrected Decimal handling
+and cache validation, and shortened the review. Part B's executable evidence
+is in `tests/test_review.py`; the supplied `tool.py` remains unchanged.
 
 ## One thing the AI got wrong
 
-Small and concrete: while silencing test warnings it appended
-`filterwarnings` to the end of `pyproject.toml`, which landed it inside the
-`[tool.hatch]` table instead of `[tool.pytest.ini_options]`. The test run still
-printed the warnings; that is how it was noticed, and the line was moved. The
-more useful catch was one it nearly did not make: its first probe of the upstream
-used a far-future date, got a 404, and would have concluded "future dates fail
-upstream, nothing to do". Probing *tomorrow* showed a 200 with today's rate. The
-lesson I took: check the boundary right next to the edge, not far from it.
+The initial review claimed the cache had no await between reading and writing,
+so a race could only duplicate a fetch. Codex's controlled concurrency test held
+an old-date response until a newer-date request finished: the late response
+overwrote the shared pair-only key. That disproved the claim. The corrected
+review identifies the missing date in the key; a lock alone would not fix it.
+The implementation also cached rates before validating their dates. Recovery
+tests failed until those checks were moved before insertion.
