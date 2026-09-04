@@ -52,8 +52,8 @@ class UpstreamClient:
             raise errors.upstream_error(response.status_code)
 
         try:
-            payload = response.json()
-        except ValueError:
+            payload = response.json(parse_float=Decimal, parse_int=Decimal)
+        except (ValueError, InvalidOperation):
             raise errors.upstream_invalid("body is not JSON")
         return _parse(payload, base, target)
 
@@ -77,13 +77,19 @@ def _parse(payload: object, base: str, target: str) -> PublishedRate:
     if not isinstance(rates, dict) or target not in rates:
         raise errors.upstream_invalid(f"no rate for {target} in the answer")
     raw = rates[target]
-    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+    if isinstance(raw, bool) or not isinstance(raw, (Decimal, int, float, str)):
         raise errors.upstream_invalid(f"rate for {target} is not a number")
+    if len(str(raw)) > 96:
+        raise errors.upstream_invalid("rate exceeds the supported numeric precision")
     try:
         rate = Decimal(str(raw))
     except InvalidOperation:
         raise errors.upstream_invalid(f"rate for {target} is not a number")
     if not rate.is_finite() or rate <= 0:
         raise errors.upstream_invalid(f"rate for {target} is {raw!r}")
+    # Bound untrusted numeric data so multiplication and cent rounding fit in
+    # the service's 64-digit context, without silently rounding the rate itself.
+    if not Decimal("1e-24") <= rate <= Decimal("1e24") or len(rate.as_tuple().digits) > 36:
+        raise errors.upstream_invalid("rate must be between 1e-24 and 1e24 with at most 36 significant digits")
 
     return PublishedRate(base=base, target=target, rate=rate, published_on=published_on)

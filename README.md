@@ -14,7 +14,8 @@ FX_UPSTREAM_BASE=http://localhost:9999 ./run.sh   # point at a fake upstream
 ```
 
 Needs Python 3.11+. `run.sh` uses [uv](https://docs.astral.sh/uv/) if installed,
-otherwise creates `.venv` with pip.
+otherwise creates `.venv` with pip. The first dependency install needs network
+access; tests themselves make no external requests (one checks localhost refusal).
 
 ```bash
 curl 'localhost:8080/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28'
@@ -27,8 +28,8 @@ curl 'localhost:8080/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28'
 ```
 
 The upstream is faked in-process (`tests/fake_upstream.py` mimics
-frankfurter.dev's real behaviour). No network is used; the suite also proves it
-by pointing one test at a closed port.
+the subset of Frankfurter behaviour used here). Rates are deterministic fixtures,
+not a record of live prices. Part B evidence lives in `tests/test_review.py`.
 
 ## The endpoint
 
@@ -36,11 +37,11 @@ by pointing one test at a closed port.
 
 | Parameter | Required | Notes |
 |---|---|---|
-| `amount` | yes | decimal, `> 0`, `<= 1e12`; any number of decimal places |
+| `amount` | yes | decimal, `1e-24` to `1e12`, at most 24 input characters; ten decimal places accepted |
 | `from`, `to` | yes | ISO 4217 code, case-insensitive |
 | `date` | no | `YYYY-MM-DD`; defaults to today in Frankfurt time (the ECB's calendar) |
 
-Success, `200`:
+Example success for a weekend query (`date=2026-08-29`), `200`:
 
 ```json
 {
@@ -49,12 +50,17 @@ Success, `200`:
   "rate_date": "2026-08-28", "asked_date": "2026-08-29",
   "source": "ECB via frankfurter.dev",
   "rate_is_fallback": true,
-  "note": "No ECB rate was published for 2026-08-29; this is the most recent earlier rate, from 2026-08-28."
+  "note": "The provider returned an earlier rate for 2026-08-29; the rate used is from 2026-08-28."
 }
 ```
 
 - `rate` is passed through from the ECB unrounded. `result` is money: rounded to
-  2 decimals, half up. Arithmetic is done in `Decimal`, never float.
+  2 decimals, half up (a fixed tool policy, including JPY). Parsing, arithmetic
+  and numeric JSON output use `Decimal` without a float conversion. Consumers
+  need a decimal-aware JSON parser to preserve precision too.
+- Accepted rates are finite, `1e-24` to `1e24`, with at most 36 significant
+  digits and 96 characters in their parsed representation. These defensive
+  limits keep arithmetic bounded; values outside them are `502 upstream_invalid`.
 - `rate_date` is the day the ECB actually published the rate, as stated by the
   upstream itself. `asked_date` is what the caller asked for.
 - `rate_is_fallback` is `true` whenever those two differ; `note` then spells it out
@@ -66,18 +72,18 @@ Failure, non-2xx: `{ "error": "<code>", "message": "<sentence>" }`.
 
 | HTTP | `error` | When |
 |---|---|---|
-| 400 | `invalid_amount` | missing, not a number, zero, negative, NaN/inf, > 1e12, > 24 characters |
+| 400 | `invalid_amount` | missing, not a number, zero, negative, NaN/inf, < 1e-24, > 1e12, > 24 characters |
 | 400 | `invalid_currency` | missing, or not three letters |
 | 400 | `same_currency` | `from` equals `to` |
 | 400 | `invalid_date` | not `YYYY-MM-DD` or not a real calendar day |
 | 400 | `date_in_future` | later than today (Frankfurt time) |
 | 400 | `date_before_series` | before 1999-01-04, when euro reference rates begin |
-| 404 | `unknown_currency` | the ECB has no rate for that pair (upstream 404) |
+| 404 | `unknown_currency` | upstream 404: unsupported pair or unavailable historical coverage (see NOTES) |
 | 404 | `no_rate_for_date` | nearest earlier published rate is more than 7 days old |
 | 502 | `upstream_error` | upstream answered 4xx/5xx other than 404 |
-| 502 | `upstream_invalid` | not JSON, wrong shape, rate missing/non-numeric/non-positive, wrong base, or a rate dated *after* the asked day |
+| 502 | `upstream_invalid` | not JSON, wrong shape, rate missing/non-numeric/non-positive/outside numeric limits, wrong base, or a rate dated *after* the asked day |
 | 503 | `upstream_unavailable` | connection refused / DNS / TLS failure |
-| 504 | `upstream_timeout` | no answer within 5 s (`FX_UPSTREAM_TIMEOUT`) |
+| 504 | `upstream_timeout` | HTTPX network operation timed out (default 5 s; `FX_UPSTREAM_TIMEOUT`) |
 
 ## What happens in each case the brief asks about
 
@@ -88,12 +94,12 @@ Failure, non-2xx: `{ "error": "<code>", "message": "<sentence>" }`.
 | Date before the series | `400 date_before_series`, before touching the upstream. |
 | Unknown currency code | `404 unknown_currency`. Malformed codes (`EURO`) are `400 invalid_currency` locally. |
 | `from` == `to` | `400 same_currency`, no upstream call. |
-| Upstream slow | `504 upstream_timeout` after 5 s. |
+| Upstream slow | `504 upstream_timeout`; timeout is per network operation, not a total request deadline. |
 | Upstream 500 | `502 upstream_error`. |
 | Upstream not JSON / wrong shape | `502 upstream_invalid`. |
 | `amount` missing / zero / negative | `400 invalid_amount`. |
 | `amount` with ten decimal places | accepted; echoed back as given; `result` rounded to cents. |
-| Repeated question | answered from an in-memory cache keyed by `(from, to, date)`. Past days are final and cached for good; today's answer is re-asked after 10 min (`FX_TODAY_CACHE_TTL`) because the ECB publishes around 16:00 CET. Failures are never cached. |
+| Repeated question | answered from an in-memory cache keyed by `(from, to, date)`. Past responses have no TTL (historical stability assumption); today's answer is re-asked after 10 min (`FX_TODAY_CACHE_TTL`) because the ECB publishes around 16:00 CET. Failures are never cached. |
 
 ## Configuration
 

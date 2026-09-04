@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from zoneinfo import ZoneInfo
 
 from fx_tool import errors
@@ -71,6 +71,8 @@ def _parse_amount(raw: str | None) -> Decimal:
         raise errors.invalid_amount(f"'amount' must be a finite number, got {raw!r}.")
     if amount <= 0:
         raise errors.invalid_amount("'amount' must be greater than zero.")
+    if amount < Decimal("1e-24"):
+        raise errors.invalid_amount("'amount' must be at least 1e-24.")
     if amount > _MAX_AMOUNT:
         raise errors.invalid_amount(f"'amount' must be at most {_MAX_AMOUNT:f}.")
     return amount
@@ -123,16 +125,11 @@ class Converter:
 
         published = await self._published_rate(req, today)
 
-        # The upstream may only ever hand us a rate from the asked day or earlier.
-        gap = (req.asked_date - published.published_on).days
-        if gap < 0:
-            raise errors.upstream_invalid(
-                f"rate dated {published.published_on} is newer than the asked date {req.asked_date}"
-            )
-        if gap > self._settings.max_fallback_days:
-            raise errors.no_rate_for_date(req.asked_date.isoformat(), published.published_on.isoformat())
-
-        result = (req.amount * published.rate).quantize(_CENT, rounding=ROUND_HALF_UP)
+        # At most 24 amount digits * 36 rate digits: the product is exact before
+        # the one intentional rounding step. Do not change the global context.
+        with localcontext() as context:
+            context.prec = 64
+            result = (req.amount * published.rate).quantize(_CENT, rounding=ROUND_HALF_UP)
         return Conversion(
             amount=req.amount,
             base=req.base,
@@ -154,6 +151,16 @@ class Converter:
             del self._cache[key]
 
         rate = await self._upstream.rate_on(req.base, req.target, req.asked_date)
+
+        # Validate before caching: a transient bad response must not poison a
+        # historical key forever after the provider has recovered.
+        gap = (req.asked_date - rate.published_on).days
+        if gap < 0:
+            raise errors.upstream_invalid(
+                f"rate dated {rate.published_on} is newer than the asked date {req.asked_date}"
+            )
+        if gap > self._settings.max_fallback_days:
+            raise errors.no_rate_for_date(req.asked_date.isoformat(), rate.published_on.isoformat())
 
         # A past day's answer is final. Today's may still change once the ECB
         # publishes this afternoon, so it is only trusted for a short while.
